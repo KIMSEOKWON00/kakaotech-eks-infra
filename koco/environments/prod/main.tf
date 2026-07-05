@@ -145,7 +145,8 @@ module "sa" {
 module "iam" {
   source = "../../modules/iam"
 
-  role-alc-oidc_without_https = local.oidc_url_without_https
+  cluster_name = local.cluster_name
+
   role-alc-namespace = module.sa.sa-namespace
   role-alc-sa_name = module.sa.sa-name
 

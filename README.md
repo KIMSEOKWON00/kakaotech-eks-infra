@@ -5,13 +5,12 @@
 ██╔═██╗ ██║   ██║██║     ██║   ██║
 ██║  ██╗╚██████╔╝╚██████╗╚██████╔╝
 ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═════╝
-
-  Terraform-based AWS EKS Infrastructure
+Terraform × EKS × GitOps Infrastructure
 ```
 
-# KOCO — Terraform 기반 AWS EKS 인프라
+## 한 줄 소개
 
-> Terraform으로 전체 라이프사이클을 관리하는 AWS EKS 인프라 프로젝트입니다. VPC부터 EKS 클러스터, IRSA 기반 IAM 연동, Helm(AWS Load Balancer Controller / ArgoCD), CloudFront + S3 정적 호스팅, ECR까지 — 하나의 코드베이스로 dev/prod 두 환경을 동일한 구조로 프로비저닝합니다.
+**Terraform으로 AWS EKS 클러스터와 주변 인프라(VPC, IAM, ALB, CloudFront, ECR 등)를 코드화하고, ArgoCD 기반 GitOps로 애플리케이션 배포를 자동화한 인프라 프로젝트**입니다. IAM 인증 체계를 OIDC/IRSA에서 **EKS Pod Identity**로 전환했고, 인프라(Terraform 리포)와 애플리케이션(GitOps 리포)의 책임 경계를 명확히 분리해 설계했습니다.
 
 ---
 
@@ -24,483 +23,361 @@
 5. [Helm 배포 구성](#helm-배포-구성)
 6. [IAM 및 IRSA 설계](#iam-및-irsa-설계)
 7. [네트워크 설계](#네트워크-설계)
-8. [스토리지 및 CDN](#스토리지-및-cdn)
-9. [데이터베이스](#데이터베이스)
-10. [OpenVPN](#openvpn)
-11. [ECR](#ecr)
-12. [알려진 제약 사항](#알려진-제약-사항)
-13. [실행 방법](#실행-방법)
+8. [스토리지 / CDN / 이미지 레지스트리](#스토리지--cdn--이미지-레지스트리)
+9. [실행 방법](#실행-방법)
+10. [연관 프로젝트](#연관-프로젝트)
 
 ---
 
 ## 전체 인프라 아키텍처
 
-```mermaid
-flowchart TB
-    Internet((Internet))
+트래픽이 실제로 흐르는 경로와, 코드가 배포되는 경로(GitOps)는 서로 다른 흐름이라 두 다이어그램으로 나눠서 표현했습니다.
 
-    subgraph DNS["Route 53"]
-        R53CDN["root / www<br/>→ CloudFront"]
-        R53ALB["argocd / kibana / api / www.api<br/>→ ALB"]
-    end
+### 트래픽 흐름
 
-    CDN["CloudFront (CDN)"]
-    S3["S3 정적 사이트<br/>(OAI 경유)"]
-    ALB["ALB<br/>(AWS Load Balancer Controller가<br/>Ingress 기반으로 자동 생성/관리)"]
+```
+Internet
+   │
+   ▼
+CloudFront ── (S3 오리진: 프론트엔드 정적 파일)
+   │
+   ▼ (/api, /oauth)
+ALB (koco-alb-group, 4개 서브도메인 공유)
+   │
+   ▼
+┌──────────────────────── EKS Cluster (v1.32) ────────────────────────────┐
+│                                                                         │
+│  infra 노드그룹 (t3.medium × 4~5)       app 노드그룹 (t3.medium × 1~2)      │
+│  ├── ArgoCD (argo-cd 5.51.6)           └── Spring Boot                  │
+│  ├── Elasticsearch / Kibana                                             │
+│  ├── Filebeat / Metricbeat / APM Server                                 │
+│  └── Redis                                                              │
+│                                                                         │
+│  ALB Controller (aws-load-balancer-controller 1.7.1, EKS Pod Identity)  │
+└─────────────────────────────────────────────────────────────────────────┘
 
-    subgraph EKS["EKS Cluster (Public + Private Endpoint)"]
-        NGInfra["Node Group: infra<br/>t3.medium × 4~5<br/>(ArgoCD, ELK 등)"]
-        NGApp["Node Group: app<br/>t3.medium × 1~2<br/>(Spring/FastAPI)"]
-    end
-
-    SVC["Service Subnet<br/>(Private, AZ1/AZ2)"]
-    NAT["NAT Gateway (AZ1)"]
-    IGW["Internet Gateway"]
-    DB[("EC2 MySQL<br/>DB Subnet (AZ1)")]
-    Backup[("S3: koco-db-backup")]
-    PubSubnet["Public Subnet (AZ1/AZ2)"]
-    VPN["OpenVPN EC2<br/>(고정 EIP)"]
-    ECR["ECR<br/>(독립 리소스)"]
-
-    Internet --> R53CDN --> CDN
-    Internet --> R53ALB --> ALB
-    CDN -->|정적 파일| S3
-    CDN -->|"/api/*, /oauth/*"| ALB
-    ALB --> EKS
-    NGInfra --- SVC
-    NGApp --- SVC
-    SVC --> NAT --> IGW --> Internet
-    SVC --> DB
-    Backup -.초기 데이터 복원.-> DB
-    PubSubnet --> VPN
-    VPN -.관리자 SSH/DB 접근.-> SVC
-    VPN -.관리자 접근.-> DB
+(EKS 클러스터 밖, Terraform이 별도 프로비저닝)
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│ EC2 MySQL     │   │ ECR           │   │ OpenVPN EC2   │
+│ (db_instance) │   │ (이미지 저장)    │   │ (관리자 접근)    │
+└───────────────┘   └───────────────┘   └───────────────┘
 ```
 
-### 트래픽 흐름 요약
+### 배포 흐름 (GitOps)
 
-| 흐름 | 경로 |
-|---|---|
-| 정적 프론트엔드 | 사용자 → Route53 → CloudFront → S3(OAI) |
-| API / 인증 | 사용자 → CloudFront(`/api/*`, `/oauth/*`, 무캐시) → ALB → EKS Ingress → app 노드그룹 |
-| GitOps 대시보드 | 관리자 → Route53(`argocd.*`) → ALB → ArgoCD(ClusterIP + Ingress) |
-| DB 접근 | app Pod → DB 서브넷의 MySQL EC2(3306) |
-| 관리 접근 | 관리자 → OpenVPN EC2 → 프라이빗 서브넷 SSH/DB 직접 접근 |
+```
+Developer
+   │ git push
+   ▼
+GitOps Repository (kakaotech-21-iceT-gitops)
+   │ ArgoCD 감지 및 동기화 (App of Apps, syncWave 순서)
+   ▼
+ArgoCD (EKS 내부)
+   ├── Wave -1: EBS CSI Driver
+   ├── Wave  0: StorageClass, metrics-server
+   ├── Wave  1: Elasticsearch, Redis
+   └── Wave 2~4: Kibana, APM, Filebeat, Spring
+```
+
+**설계 의도**
+- ALB를 서비스별로 각각 만들지 않고 `koco-alb-group` 하나로 묶어 ArgoCD/Kibana/APM/API 4개 서브도메인이 공유하도록 했습니다. ALB 개수를 줄여 비용과 운영 포인트를 최소화하는 선택입니다.
+- EKS 노드그룹을 `infra`(상시 구동 인프라 워크로드)와 `app`(비즈니스 로직)으로 분리해, 워크로드 성격에 따라 스케일링 범위와 인스턴스 수를 독립적으로 조정할 수 있게 했습니다.
+- 인프라 프로비저닝(Terraform)과 워크로드 배포(GitOps/ArgoCD)를 서로 다른 리포로 분리해, 애플리케이션 배포 하나 때문에 인프라 `apply`를 실행해야 하는 상황을 없앴습니다.
 
 ---
 
 ## 사용 AWS 서비스 및 도구
 
-![Terraform](https://img.shields.io/badge/Terraform-844FBA?style=for-the-badge&logo=terraform&logoColor=white)
-![AWS](https://img.shields.io/badge/AWS-232F3E?style=for-the-badge&logo=amazonaws&logoColor=white)
-![EKS](https://img.shields.io/badge/Amazon%20EKS-FF9900?style=for-the-badge&logo=kubernetes&logoColor=white)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)
-![Helm](https://img.shields.io/badge/Helm-0F1689?style=for-the-badge&logo=helm&logoColor=white)
-![ArgoCD](https://img.shields.io/badge/Argo%20CD-EF7B4D?style=for-the-badge&logo=argo&logoColor=white)
+**AWS**
 
-![VPC](https://img.shields.io/badge/Amazon%20VPC-8C4FFF?style=for-the-badge&logo=amazonaws&logoColor=white)
-![EC2](https://img.shields.io/badge/Amazon%20EC2-FF9900?style=for-the-badge&logo=amazonec2&logoColor=white)
-![S3](https://img.shields.io/badge/Amazon%20S3-569A31?style=for-the-badge&logo=amazons3&logoColor=white)
-![CloudFront](https://img.shields.io/badge/CloudFront-8C4FFF?style=for-the-badge&logo=amazonaws&logoColor=white)
-![Route53](https://img.shields.io/badge/Route%2053-8C4FFF?style=for-the-badge&logo=amazonaws&logoColor=white)
-![ECR](https://img.shields.io/badge/Amazon%20ECR-FF9900?style=for-the-badge&logo=amazonaws&logoColor=white)
-![IAM](https://img.shields.io/badge/IAM-DD344C?style=for-the-badge&logo=amazoniam&logoColor=white)
-![ACM](https://img.shields.io/badge/Certificate%20Manager-DD344C?style=for-the-badge&logo=amazonaws&logoColor=white)
-![DynamoDB](https://img.shields.io/badge/DynamoDB-4053D6?style=for-the-badge&logo=amazondynamodb&logoColor=white)
+![Amazon EKS](https://img.shields.io/badge/Amazon%20EKS-FF9900?style=flat-square&logo=amazoneks&logoColor=white)
+![Amazon VPC](https://img.shields.io/badge/Amazon%20VPC-232F3E?style=flat-square&logo=amazonaws&logoColor=white)
+![AWS ALB](https://img.shields.io/badge/ALB-FF9900?style=flat-square&logo=amazonaws&logoColor=white)
+![Amazon S3](https://img.shields.io/badge/Amazon%20S3-569A31?style=flat-square&logo=amazons3&logoColor=white)
+![CloudFront](https://img.shields.io/badge/CloudFront-8C4FFF?style=flat-square&logo=amazonaws&logoColor=white)
+![Amazon ECR](https://img.shields.io/badge/Amazon%20ECR-FF9900?style=flat-square&logo=amazonecs&logoColor=white)
+![Route53](https://img.shields.io/badge/Route53-8C4FFF?style=flat-square&logo=amazonroute53&logoColor=white)
+![IAM](https://img.shields.io/badge/IAM-DD344C?style=flat-square&logo=amazonaws&logoColor=white)
+![EBS](https://img.shields.io/badge/EBS-FF9900?style=flat-square&logo=amazonaws&logoColor=white)
+![EC2](https://img.shields.io/badge/EC2-FF9900?style=flat-square&logo=amazonec2&logoColor=white)
 
-| 항목 | 버전 |
-|---|---|
-| AWS Provider | `hashicorp/aws ~> 5.95.0` |
-| Helm Provider | `hashicorp/helm ~> 2.13.0` |
-| EKS 원격 모듈 | `terraform-aws-modules/eks/aws ~> 20.0` |
-| EKS 클러스터 버전 | `1.32` |
-| 리전 | `ap-northeast-2` |
+**IaC**
+
+![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=flat-square&logo=terraform&logoColor=white)
+![HCL](https://img.shields.io/badge/HCL-000000?style=flat-square&logo=terraform&logoColor=white)
+
+**Kubernetes / GitOps**
+
+![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=flat-square&logo=kubernetes&logoColor=white)
+![Helm](https://img.shields.io/badge/Helm-0F1689?style=flat-square&logo=helm&logoColor=white)
+![ArgoCD](https://img.shields.io/badge/ArgoCD-EF7B4D?style=flat-square&logo=argo&logoColor=white)
+
+**모니터링**
+
+![Elasticsearch](https://img.shields.io/badge/Elasticsearch-005571?style=flat-square&logo=elasticsearch&logoColor=white)
+![Kibana](https://img.shields.io/badge/Kibana-005571?style=flat-square&logo=kibana&logoColor=white)
 
 ---
 
 ## Terraform 모듈 구조
 
-로컬 모듈 10종 + 환경별 root module(`environments/dev`, `environments/prod`)로 구성되어 있으며, dev/prod는 완전히 동일한 모듈 세트를 동일한 순서로 호출하고 변수 값(CIDR, 도메인, 리소스 네이밍)만 다릅니다.
-
-| # | 모듈 | 역할 |
-|---|---|---|
-| 1 | `vpc` | VPC, 6개 서브넷(퍼블릭/서비스/DB×2AZ), IGW, NAT, 라우팅 테이블 |
-| 2 | `security_group` | OpenVPN / EC2(Spring·FastAPI) / DB용 보안 그룹 |
-| 3 | `openvpn` | 관리자 VPN 접근용 OpenVPN EC2 + 고정 EIP |
-| 4 | `db_instance` | EC2 기반 MySQL 서버, S3 백업 복원 자동화 |
-| 5 | `iam` | 노드그룹 IAM 역할 + ALB Controller/EBS CSI용 IRSA 역할 |
-| 6 | `service_account` | ALB Controller용 Kubernetes ServiceAccount(IRSA 연동) |
-| 7 | `helm` | AWS Load Balancer Controller + ArgoCD 배포, Route53 연동 |
-| 8 | `s3_static_site` | 프론트엔드 정적 파일 호스팅(CloudFront OAI 전용 접근) |
-| 9 | `cdn` | CloudFront 배포(S3 + ALB 듀얼 오리진) |
-| 10 | `ecr` | 컨테이너 이미지 저장소 |
-
-**원격 모듈**: `terraform-aws-modules/eks/aws ~>20.0`을 사용해 EKS 클러스터·노드그룹·OIDC Provider·애드온 생성을 위임하고, v20의 **Access Entry API**(`enable_cluster_creator_admin_permissions`)로 클러스터 접근 권한을 관리합니다(레거시 `aws_auth` ConfigMap 미사용).
-
-> 클러스터/노드그룹/OIDC Provider를 직접 `aws_eks_cluster` 등 raw 리소스로 구현하는 대신 커뮤니티 표준 원격 모듈을 채택한 이유는, EKS 신규 기능(Access Entry API 등)이 공식 모듈에 가장 먼저 반영되고, 검증된 코드로 노드그룹/애드온 관리 보일러플레이트를 줄여 로컬 모듈(`iam`, `service_account`, `helm`)의 IRSA 연동 로직에 집중할 수 있기 때문입니다.
-
-### 환경별(dev/prod) 구성 차이
-
-dev/prod는 아래 표에 해당하는 변수 값만 다르고, 그 외 모듈 구조·EKS 스펙·애드온 구성은 완전히 동일합니다.
-
-| 항목 | dev | prod |
-|---|---|---|
-| VPC CIDR | `10.110.0.0/16` | `10.120.0.0/16` |
-| 도메인 | `koco-test.click` | `ktbkoco.com` |
-| EKS 클러스터 이름 | `koco-dev-cluster` | `koco-prod-cluster` |
-| S3 정적 사이트 버킷 | `dev-koco-front-s3` | `prod-koco-front-s3` |
-| ECR 저장소 | `dev-ecr-repo` | `prod-ecr-repo` |
-
-동일한 코드베이스로 두 환경을 재현 가능하게 유지하면서, 네트워크 대역과 리소스 네이밍만 환경 변수로 분리하는 전략입니다.
-
-### 모듈 의존성 흐름
-
 ```
-koco_vpc
-  ├─→ security_group ─→ openvpn / db
-  ├─→ eks (vpc_id, service subnet)
-  └─→ helm (vpc_id)
-
-eks (OIDC issuer / provider ARN)
-  └─→ iam (IRSA 신뢰관계 구성) ←── sa (ServiceAccount 이름/네임스페이스)
-
-helm (depends_on: vpc, eks, sa, iam)
-  └─→ helm.alb_dns ─→ cdn (ALB API 오리진)
-
-s3_static_site ⇄ cdn  (OAI ARN / 버킷 이름 상호 참조)
-ecr : 독립 모듈
+koco/
+├── backend/                  # Terraform state 백엔드(S3 + DynamoDB) 부트스트랩 전용
+├── environments/
+│   ├── dev/                  # dev root module — vpc_ip_range 10.110.0.0/16, domain koco-test.click
+│   └── prod/                 # prod root module — vpc_ip_range 10.120.0.0/16, domain ktbkoco.com
+└── modules/                  # 로컬 모듈 10개
+    ├── vpc/                  # VPC, 3계층(public/service/db)×2AZ 서브넷, IGW, NAT, 라우팅 테이블
+    ├── security_group/        # openvpn/ec2/db용 보안 그룹
+    ├── openvpn/               # 퍼블릭 서브넷 OpenVPN EC2(관리자 접근용 VPN 게이트웨이)
+    ├── db_instance/           # EC2 기반 MySQL 서버(고정 프라이빗 IP, S3 백업 복원)
+    ├── iam/                   # 노드그룹 Role, ALB Controller IAM Role(Pod Identity), EBS CSI IRSA Role
+    ├── service_account/       # ALB Controller용 Kubernetes ServiceAccount
+    ├── helm/                  # ALB Controller + ArgoCD Helm 배포, ArgoCD Ingress, Route53 레코드 5개
+    ├── s3_static_site/        # 프론트엔드 정적 호스팅 S3(CloudFront OAI 전용 접근)
+    ├── cdn/                   # CloudFront 배포 + Route53(루트/www 레코드)
+    └── ecr/                   # 컨테이너 이미지 저장소
 ```
 
-### State 관리
+원격 모듈: `terraform-aws-modules/eks/aws` (`~>20.0`) — EKS 클러스터/노드그룹/애드온을 담당하며, 로컬 `modules/eks`는 별도로 두지 않았습니다.
 
-`koco/backend/` 모듈이 Terraform state용 S3 버킷(버저닝+SSE+퍼블릭 차단)과 DynamoDB 잠금 테이블을 부트스트랩하며, 각 환경의 `provider.tf`에서 `backend "s3"` 블록으로 원격 state를 참조합니다.
+**설계 의도**: `environments/dev`, `environments/prod` 두 root module은 `vpc → security_group → openvpn → db → eks → sa → iam → helm → s3_static_site → cdn → ecr` 11개 모듈을 완전히 동일한 순서로 호출합니다. 두 환경의 차이는 CIDR 대역·도메인명·S3/ECR 네이밍 같은 변수값에만 있고 구조 자체는 동일하게 유지해, dev에서 검증한 인프라 토폴로지가 prod에서도 그대로 재현되도록 했습니다.
+
+모듈 간 의존성은 output→input 참조로 구성됩니다.
+
+```
+koco_vpc ──→ koco_security_group ──→ openvpn / db
+koco_vpc ──→ eks (vpc_id, service_az1/az2_id)
+iam.eks_node_group_role_arn ──→ eks (노드그룹 IAM 역할)
+eks(cluster_oidc_issuer_url, oidc_provider_arn) ──→ iam (IRSA/Pod Identity 구성)
+sa(namespace/name) ──→ iam (Pod Identity Association) ──→ helm
+helm.alb_dns ──→ cdn (ALB API 오리진)
+s3_static_site ⇄ cdn (OAI arn / bucket name 상호 참조)
+```
+
+`eks`↔`iam`, `s3_static_site`↔`cdn` 두 지점은 모듈 단위로 보면 순환 참조처럼 보이지만, 실제로는 각 모듈 내부의 서로 다른 리소스가 서로 다른 방향으로 참조하고 있어 Terraform이 리소스 단위 그래프로 순서를 정상적으로 풀어냅니다.
+
+**State 관리**: S3 버킷(`koco-terraformstate`) + DynamoDB 테이블(동일 이름 재사용)로 원격 state와 잠금을 구성했습니다.
 
 ---
 
 ## EKS 클러스터 구성
 
-```hcl
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "~>20.0"
+| 항목 | 값 |
+|---|---|
+| 클러스터 버전 | `1.32` (dev/prod 동일) |
+| 엔드포인트 접근 | Public + Private 동시 활성화 |
+| 노드그룹 | `infra`(t3.medium, 4~5대, disk 30GB) / `app`(t3.medium, 1~2대, disk 3GB) |
+| 클러스터 액세스 | Access Entry API 기반, `enable_cluster_creator_admin_permissions = true` |
+| EKS 애드온 | `coredns`, `kube-proxy`, `vpc-cni`, `eks-pod-identity-agent` (모두 `most_recent = true`) |
 
-  cluster_name    = local.cluster_name   # koco-dev-cluster / koco-prod-cluster
-  cluster_version = "1.32"
+**설계 의도 — 노드그룹 역할 분리**: `infra` 노드그룹은 ArgoCD·ELK 스택처럼 상시 구동되는 인프라 워크로드를, `app` 노드그룹은 Spring Boot 애플리케이션을 위해 분리했습니다. `node-group=infra` / `node-group=app` 라벨로 두 그룹을 구분해, 향후 `nodeSelector`/`tolerations`로 스케줄링을 세밀하게 제어할 수 있는 기반을 마련했습니다.
 
-  cluster_endpoint_public_access  = true
-  cluster_endpoint_private_access = true
+**설계 의도 — 원격 EKS 모듈 채택**: 노드그룹·애드온·OIDC Provider·Access Entry를 처음부터 직접 구현하는 대신 `terraform-aws-modules/eks/aws` v20을 사용해, 커뮤니티에서 검증된 표준 패턴으로 클러스터 생성 로직의 복잡도를 낮췄습니다.
 
-  cluster_addons = {
-    coredns                = { most_recent = true }
-    kube-proxy             = { most_recent = true }
-    vpc-cni                = { most_recent = true }
-    eks-pod-identity-agent = { most_recent = true }
-  }
+**설계 의도 — `eks-pod-identity-agent` 애드온**: ALB Controller의 인증 방식을 Pod Identity로 전환하기 위한 전제 조건으로 포함했습니다(아래 [IAM 및 IRSA 설계](#iam-및-irsa-설계) 참조).
 
-  eks_managed_node_group_defaults = {
-    ami_type     = "AL2023_x86_64_STANDARD"
-    iam_role_arn = module.iam.eks_node_group_role_arn
-  }
-
-  eks_managed_node_groups = {
-    infra = { instance_types = ["t3.medium"], min_size = 4, max_size = 5, desired_size = 4, disk_size = 30 }
-    app   = { instance_types = ["t3.medium"], min_size = 1, max_size = 2, desired_size = 2, disk_size = 3  }
-  }
-
-  enable_cluster_creator_admin_permissions = true
-}
-```
-
-### 노드 그룹 설계
-
-| 노드그룹 | 용도 | 인스턴스 | min/max/desired | disk |
-|---|---|---|---|---|
-| `infra` | ArgoCD, ELK 등 인프라 워크로드 | t3.medium | 4/5/4 | 30GB |
-| `app` | Spring/FastAPI 애플리케이션 워크로드 | t3.medium | 1/2/2 | 3GB |
-
-인프라 워크로드와 애플리케이션 워크로드를 노드그룹 라벨(`node-group=infra`/`app`)로 분리해 스케줄링 관심사를 나누는 설계입니다. 두 노드그룹 모두 서비스(프라이빗) 서브넷 2개 AZ에 걸쳐 배치되어 기본적인 고가용성을 확보합니다.
-
-dev/prod가 동일한 노드그룹 스펙을 쓰는 이유는 두 환경의 인프라 구조를 100% 동일하게 유지해, dev에서 검증한 배포·스케줄링 동작이 prod에서도 그대로 재현되도록 하기 위함입니다. 트래픽 규모에 따라 환경별로 노드 수/인스턴스 타입을 차등화하는 전략은 현재 범위 밖이며, 필요 시 `eks_managed_node_groups` 값만 환경 변수로 분리하면 됩니다.
-
-### 클러스터 접근 관리
-
-- v20의 **Access Entry API** 채택(`enable_cluster_creator_admin_permissions = true`) — 클러스터 생성자에게 자동으로 관리자 권한 부여.
-- `enable_irsa` 기본값(`true`)으로 **OIDC Identity Provider**가 자동 생성되어 IRSA의 기반이 됩니다.
+두 노드그룹 모두 `eks_managed_node_group_defaults.iam_role_arn`으로 동일한 `eks-node-group-role`을 공유합니다.
 
 ---
 
 ## Helm 배포 구성
 
-`helm` 모듈이 EKS 클러스터 위에 두 개의 핵심 애드온을 Helm으로 배포합니다.
+`modules/helm`에서 Helm으로 2개의 컴포넌트를 배포합니다.
 
 ### AWS Load Balancer Controller
 
-```hcl
-resource "helm_release" "aws_load_balancer_controller" {
-  name       = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  version    = "1.7.1"
+| 항목 | 값 |
+|---|---|
+| Chart | `aws-load-balancer-controller` (`1.7.1`, 버전 고정) |
+| Namespace | `kube-system` |
+| ServiceAccount | `serviceAccount.create = false` (기존 SA 사용) |
+| 인증 방식 | **EKS Pod Identity** |
 
-  set { name = "clusterName" ; value = var.cluster_name }
-  set { name = "region"      ; value = var.region }
-  set { name = "vpcId"       ; value = var.vpc_id }
-  set { name = "serviceAccount.create" ; value = "false" }
-  set { name = "serviceAccount.name"   ; value = "aws-load-balancer-controller" }
-}
-```
+**설계 의도**: 처음에는 OIDC/IRSA 방식으로 설계했으나, ServiceAccount의 `eks.amazonaws.com/role-arn` 어노테이션 값과 IAM Role ARN을 연결하는 배선이 실제로는 끊어져 있었습니다(자세한 내용은 [IAM 및 IRSA 설계](#iam-및-irsa-설계) 참조). 이를 계기로 어노테이션 없이 `aws_eks_pod_identity_association`으로 직접 연결하는 Pod Identity 방식으로 전환해, 같은 종류의 배선 누락이 재발할 여지를 구조적으로 줄였습니다.
 
-- Kubernetes Ingress(`kubernetes.io/ingress.class: alb`) 리소스를 감시해 ALB를 자동으로 생성/관리합니다.
-- `serviceAccount.create = false`로 별도 `service_account` 모듈이 미리 생성한 ServiceAccount를 재사용 — IAM Role과의 연동은 **IRSA(IAM Roles for Service Accounts)** 패턴을 통해 이루어지도록 설계되어 있습니다(자세한 내용은 [IAM 및 IRSA 설계](#iam-및-irsa-설계) 참고).
+ArgoCD Ingress(`kubernetes.io/ingress.class=alb`, `group.name=koco-alb-group`, `scheme=internet-facing`)를 이 컨트롤러가 감지해 실제 ALB를 생성하고, 생성된 ALB를 조회해 Route53에 `argocd`/`kibana`/`api_root`/`api_www`/`apm` 5개 레코드를 alias로 등록합니다.
 
 ### ArgoCD
 
-```hcl
-resource "helm_release" "argocd" {
-  name             = "argocd"
-  namespace        = "argocd"
-  repository       = "https://argoproj.github.io/argo-helm"
-  chart            = "argo-cd"
-  version          = "5.51.6"
-  create_namespace = true
+| 항목 | 값 |
+|---|---|
+| Chart | `argo-cd` (`5.51.6`) |
+| Namespace | `argocd` (Helm이 신규 생성) |
+| Service 타입 | `ClusterIP` |
+| 외부 노출 | 별도 ALB Ingress(`argocd_ingress`) |
 
-  set { name = "server.service.type"            ; value = "ClusterIP" }
-  set { name = "server.extraArgs[0]"            ; value = "--insecure" }
-  set { name = "configs.params.server.insecure" ; value = "true" }
-}
-```
+**설계 의도**: `server.extraArgs=--insecure` + `configs.params.server.insecure=true`로 ArgoCD 서버 자체는 TLS 없이(HTTP) 구동하고, TLS 종료는 ALB의 443 리스너가 전담하도록 했습니다. "엣지에서 TLS 종료, 내부는 평문"이라는 일반적인 ALB Ingress 패턴을 그대로 따른 것입니다.
 
-- ArgoCD 서버는 `ClusterIP`로 클러스터 내부에만 노출하고, 별도의 `kubernetes_ingress_v1` 리소스(ALB Ingress, internet-facing)로 `argocd.<domain>` 경로를 통해 외부 접근을 제공합니다.
-- ALB의 HTTPS(443) 리스너가 TLS 종료를 담당하고 ALB→Pod 구간은 `--insecure`(HTTP)로 통신 — TLS 종료를 로드밸런서에서 처리하는 일반적인 패턴입니다.
-- ALB 생성 후 `data.aws_lbs`/`data.aws_lb`로 조회하여 Route53에 `argocd` / `kibana` / `api` / `www.api` 서브도메인 레코드를 자동 등록합니다.
+배포된 ArgoCD는 GitOps 리포를 감지해 App of Apps 패턴으로 Elasticsearch/Kibana/Filebeat/Metricbeat/APM/Redis/Spring Boot 등 실제 워크로드를 `syncWave` 순서(Wave -1: EBS CSI Driver → Wave 0: StorageClass/metrics-server → Wave 1: Elasticsearch/Redis → Wave 2~4: Kibana/APM/Filebeat/Spring)에 따라 배포합니다. 스토리지 드라이버가 준비되기 전에 PVC를 요구하는 워크로드가 먼저 뜨는 문제를 이 순서 강제로 방지합니다.
 
-**GitOps 워크플로우**: ArgoCD는 애플리케이션 매니페스트를 별도의 GitOps 전용 저장소인 [`kakaotech-21-iceT-gitops`](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops)를 Source of Truth로 두고 동기화합니다. 이 저장소(Terraform 인프라 저장소)는 EKS/ALB Controller/ArgoCD "플랫폼"을 프로비저닝하는 역할까지만 담당하고, 그 위에서 실행되는 애플리케이션의 배포 선언(Deployment/Service/Ingress 매니페스트 등)은 GitOps 저장소에서 별도로 관리하는 **인프라-애플리케이션 저장소 분리** 구조입니다.
+### Terraform ↔ GitOps 역할 분리
+
+이 프로젝트는 인프라(Terraform)와 애플리케이션(GitOps/ArgoCD)의 책임을 계층별로 명확히 나눕니다.
+
+| 계층 | 이 리포 (Terraform) | GitOps 리포 (ArgoCD) |
+|------|-------------------|---------------------|
+| 네트워크 | VPC, 서브넷, SG, NAT | - |
+| 컴퓨팅 | EKS 클러스터, 노드그룹 | - |
+| IAM | IRSA/Pod Identity 역할 | SA 어노테이션으로 IRSA 소비 |
+| 컨테이너 런타임 | ECR 레포지토리 | 이미지 pull (values.yaml) |
+| 인그레스 컨트롤러 | ALB Controller 설치 + Pod Identity 연결 | Ingress 리소스 정의 |
+| 스토리지(오브젝트) | S3, CloudFront, RDS(EC2 MySQL) | - |
+| 스토리지(블록) | EBS CSI IRSA 역할 | EBS CSI Driver, PVC 관리 |
+| 애플리케이션 배포 | - | Spring, ELK, Redis, 애드온 |
+| DNS | Route53 레코드 5개 생성 | Ingress host 정의 |
+| 인증서 | ACM ARN 변수 참조 (수동 발급) | values.yaml ARN 참조 |
+| 시크릿 | - | spring-env-secret 관리 |
+
+두 리포는 동일 AWS 계정/클러스터를 공유하며, 도메인·ACM ARN 등 공유 값은 각 리포에서 별도 관리되므로 변경 시 두 리포를 모두 수정해야 합니다.
 
 ---
 
 ## IAM 및 IRSA 설계
 
-### IAM 역할 구성
-
-| 역할 | 용도 | 신뢰 주체 |
+| 역할 | 용도 | 인증 방식 |
 |---|---|---|
-| `eks-node-group-role` | EKS 노드그룹(EC2) 공유 역할 | `ec2.amazonaws.com` (`AmazonEKSWorkerNodePolicy` + `AmazonEBSCSIDriverPolicy`) |
-| `alb-ingress-sa-role` | AWS Load Balancer Controller용 IRSA | OIDC Federated |
-| `AmazonEKS_EBS_CSI_Driver_IRSA` | EBS CSI Driver용 IRSA | OIDC Federated |
+| `eks-node-group-role` | EKS 노드그룹(EC2 워커) | `ec2.amazonaws.com` + `AmazonEKSWorkerNodePolicy`/`AmazonEBSCSIDriverPolicy` |
+| `alb-ingress-sa-role` | ALB Controller | **EKS Pod Identity** |
+| `AmazonEKS_EBS_CSI_Driver_IRSA` | EBS CSI Driver | OIDC/IRSA (Federated) |
 
-### IRSA 동작 원리
+### ALB Controller — IRSA에서 Pod Identity로 전환
+
+처음 설계는 EKS의 표준 IRSA 패턴을 따랐습니다: OIDC Provider를 Federated 신뢰 주체로 하고, `sub`/`aud` 조건으로 특정 namespace·ServiceAccount만 역할을 assume하도록 제한하는 구조입니다. 하지만 실제 코드를 검증한 결과 이 체인이 두 지점에서 끊어져 있었습니다.
+
+1. `modules/service_account`의 `sa-annotations` 기본값이 `eks.amazonaws.com/role-arn = ""`(빈 문자열)이었고, 루트 모듈에서 이를 override하지 않음
+2. `modules/iam`이 `alb_ingress_sa_role`의 ARN을 output으로 노출하지 않아, override하려 해도 참조할 값 자체가 없었음
+
+즉 ServiceAccount 어노테이션과 IAM Role ARN 두 곳을 서로 다른 모듈에서 정확히 맞춰야 하는 IRSA 방식의 구조적 특성 때문에 배선이 누락된 상태였습니다. 이를 근본적으로 해결하기 위해 인증 방식 자체를 **EKS Pod Identity**로 전환했습니다.
 
 ```hcl
-locals {
-  oidc_url_without_https = replace(module.eks.cluster_oidc_issuer_url, "https://", "")
+resource "aws_iam_role" "alb_ingress_sa_role" {
+  name = var.role-alc_role_name
+  assume_role_policy = jsonencode({
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"]
+    }]
+  })
 }
 
-# IAM Role 신뢰 정책
-Principal = { Federated = "<oidc-provider-arn>" }
-Action    = "sts:AssumeRoleWithWebIdentity"
-Condition = {
-  StringEquals = {
-    "<oidc_url>:aud" = "sts.amazonaws.com"
-    "<oidc_url>:sub" = "system:serviceaccount:<namespace>:<sa_name>"
-  }
+resource "aws_eks_pod_identity_association" "alb_ingress" {
+  cluster_name    = var.cluster_name
+  namespace       = var.role-alc-namespace
+  service_account = var.role-alc-sa_name
+  role_arn        = aws_iam_role.alb_ingress_sa_role.arn
+  depends_on      = [aws_iam_role.ebs_csi_irsa_role]
 }
 ```
 
-EKS OIDC Identity Provider를 Federated 주체로 신뢰하고, `sub`/`aud` 조건으로 **특정 네임스페이스의 특정 ServiceAccount만** 해당 IAM Role을 assume할 수 있도록 제한하는 IRSA 표준 패턴을 적용했습니다. `cluster_oidc_issuer_url` → `iam` 모듈 → `service_account` 모듈로 이어지는 참조 체인을 통해 Terraform 모듈 간에 OIDC 신뢰 관계를 조립합니다.
+- IAM Role의 신뢰 주체를 OIDC Federated에서 `Principal.Service = pods.eks.amazonaws.com`으로 교체
+- `aws_eks_pod_identity_association`으로 클러스터/네임스페이스/ServiceAccount/Role ARN을 한 리소스에서 직접 연결 — ServiceAccount 어노테이션이나 `sub`/`aud` 조건 문자열 매칭이 더 이상 필요 없음
+- `modules/iam/outputs.tf`에 `alb_ingress_sa_role_arn` output을 추가하고, `modules/service_account`의 `sa-annotations` 기본값을 `{}`로 정리
+- 모듈 의존성은 `module.sa → module.iam → module.helm`의 **일방향 DAG**로 단순화됨
 
-> ⚠️ **현재 구현 상태**: 위 구조는 설계상 표준 IRSA 트러스트 패턴을 따르지만, 실제 코드에서는 `alb_ingress_sa_role`의 Federated 신뢰 주체 값과 ServiceAccount의 `eks.amazonaws.com/role-arn` 어노테이션 배선이 아직 끝까지 연결되어 있지 않아 IRSA 인증 체인이 완전히 동작하지는 않는 상태입니다. 자세한 내용과 개선 계획은 [알려진 제약 사항](#알려진-제약-사항)을 참고하세요.
+**IRSA와 Pod Identity의 차이**: IRSA는 ServiceAccount 어노테이션에 Role ARN을 심어두고 OIDC 토큰 교환으로 인증하는 방식이라 "어노테이션 값"과 "IAM 측 신뢰 정책 조건" 두 곳이 문자열 수준까지 일치해야 합니다. Pod Identity는 `aws_eks_pod_identity_association`이라는 단일 리소스가 이 연결을 코드로 명시하기 때문에, 이번에 겪은 것과 같은 배선 누락 가능성이 구조적으로 낮습니다.
 
-### IAM 정책 설계
+### EBS CSI Driver — 기존 IRSA 유지
 
-`alb-ingress-sa-role`에는 AWS 공식 **AWS Load Balancer Controller IAM Policy** 원문을 그대로 적용했습니다. SG/ALB/TargetGroup 관련 다수의 삭제·수정 액션에 `elbv2.k8s.aws/cluster` 리소스 태그 조건을 걸어, 컨트롤러가 직접 생성/관리하는 리소스로 권한 범위를 좁히는 AWS 권장 최소 권한 패턴을 따릅니다.
-
-### 보안 설계 특징
-
-- EKS 클러스터/노드그룹 접근은 Access Entry API로 관리해 레거시 `aws_auth` ConfigMap 운영 부담을 제거했습니다.
-- DB 백업용 IAM 역할(`ec2_s3_access`)은 특정 S3 버킷(`koco-db-backup`)으로 리소스를 좁게 스코프해 최소 권한 원칙을 적용한 사례입니다.
-- OpenVPN 인스턴스는 IAM 역할/인스턴스 프로파일을 아예 부여하지 않아, AWS API 접근 권한 없는 순수 VPN 게이트웨이로 동작하도록 설계했습니다.
+EBS CSI Driver용 `ebs_csi_irsa_role`은 이번 전환 대상에서 제외하고 기존 OIDC/IRSA 방식을 그대로 유지했습니다. 이 리포(Terraform)만 보면 신뢰 대상 ServiceAccount(`kube-system:ebs-csi-controller-sa`)가 어디서도 생성되지 않는 것처럼 보이지만, GitOps 리포의 ArgoCD Application(`ebs-csi-driver-application.yaml`)을 직접 검증한 결과 해당 Application이 만드는 ServiceAccount의 namespace·이름·Role ARN 어노테이션이 Terraform의 신뢰 정책 조건과 정확히 일치함을 확인했습니다. 두 리포를 함께 봐야 정상 동작이 확인되는 "리포 간 역할 분리" 구조이며, ALB Controller처럼 한 리포 안에서 실제로 배선이 끊어진 경우와는 본질적으로 다른 케이스입니다.
 
 ---
 
 ## 네트워크 설계
 
-### VPC 및 서브넷 구조
+VPC를 퍼블릭 / 서비스(프라이빗) / DB(프라이빗) 3계층 × 2개 가용영역(`ap-northeast-2a`, `ap-northeast-2c`) = 총 6개 `/24` 서브넷으로 분리했습니다.
 
-3계층(퍼블릭 / 서비스 / DB) × 2개 가용영역(`ap-northeast-2a`, `ap-northeast-2c`) = 총 6개 `/24` 서브넷으로 구성했습니다.
-
-| 서브넷 | 용도 | 특성 |
-|---|---|---|
-| public-az1/az2 | OpenVPN, IGW 라우팅 | `map_public_ip_on_launch=true` |
-| service-az1/az2 | EKS 노드그룹 배치 | 프라이빗, NAT 경유 아웃바운드 |
-| db-az1/az2 | MySQL EC2 배치 | 프라이빗, NAT 경유 아웃바운드 |
-
-### EKS 서브넷 태그 설계
-
-| 서브넷 | 태그 | 의미 |
-|---|---|---|
-| public-az1/az2 | `kubernetes.io/role/elb=1` | 외부 ALB 후보 서브넷 |
-| service-az1/az2 | `kubernetes.io/role/internal-elb=1` | 내부 LB 후보 서브넷 |
-
-AWS Load Balancer Controller의 서브넷 자동탐색(subnet auto-discovery)이 정상 동작하도록, 퍼블릭/서비스 서브넷에 표준 EKS 태그 컨벤션을 적용했습니다.
-
-### Security Group 계층 설계
-
-```
-sg_openvpn (0.0.0.0/0 → 22/443/1194/943)
-   │
-   ├─→ sg_ec2 : "Allow SSH from OpenVPN clients" (VPN을 통해서만 SSH 허용)
-   │
-   └─→ sg_db  : "Allow MySQL / SSH from VPN clients" (VPN을 통해서만 DB 관리 접근 허용)
-```
-
-OpenVPN을 유일한 관리 진입점으로 삼아, DB/EC2로의 SSH·관리 접근은 VPN을 경유해야만 가능하도록 보안 그룹을 계층화했습니다.
-
-### 퍼블릭/프라이빗 분리
-
-- EKS 클러스터와 데이터베이스는 프라이빗 서브넷에만 배치되어 인터넷에 직접 노출되지 않습니다.
-- 아웃바운드 트래픽은 NAT Gateway를 경유하며, EKS 클러스터 엔드포인트는 Public/Private 접근을 모두 지원해 CI/CD와 사내망 양쪽에서의 접근을 허용합니다.
-
----
-
-## 스토리지 및 CDN
-
-프론트엔드 정적 파일은 S3 + CloudFront 조합으로, API/GitOps 트래픽은 ALB를 거쳐 같은 CloudFront 배포 안에서 경로 기반으로 통합됩니다.
-
-### S3 정적 사이트 (`modules/s3_static_site`)
-
-| 항목 | 설정 |
+| 서브넷 역할 | 특징 |
 |---|---|
-| 버킷명 | dev: `dev-koco-front-s3` / prod: `prod-koco-front-s3` |
-| Public Access Block | 4개 옵션 모두 활성화 (퍼블릭 접근 완전 차단) |
-| 접근 허용 | CloudFront Origin Access Identity(OAI)에게만 `s3:GetObject` 허용 |
+| 퍼블릭 | OpenVPN, IGW 라우팅. `kubernetes.io/role/elb=1` 태그로 외부 ALB 배치 대상 |
+| 서비스(프라이빗) | **EKS 클러스터/노드그룹 전용 배치**. `kubernetes.io/role/internal-elb=1` 태그 |
+| DB(프라이빗) | MySQL EC2 인스턴스 전용 배치 |
 
-버킷은 퍼블릭 웹사이트 엔드포인트가 아니라 **REST API 엔드포인트 + OAI** 방식으로만 CloudFront에서 접근 가능하도록 설계되어 있습니다.
+**설계 의도**: EKS 클러스터와 노드는 프라이빗 서비스 서브넷에만 두고, 외부 진입점은 ALB(및 그 앞단의 CloudFront)로 한정해 공격 표면을 좁혔습니다. 퍼블릭/서비스 서브넷에 EKS용 태그(`role/elb`, `role/internal-elb`)를 미리 붙여 AWS Load Balancer Controller가 서브넷을 자동 탐색할 수 있도록 준비했습니다.
 
-### CloudFront (`modules/cdn`)
+**라우팅**: IGW 1개(퍼블릭용), NAT 게이트웨이 1개(`public-az1`에만 배치)로 구성했습니다. 서비스/DB 서브넷은 하나의 프라이빗 라우팅 테이블을 공유하며, 두 계층 간 격리는 라우팅이 아닌 보안 그룹 레벨에서 이뤄집니다.
 
-- **듀얼 오리진**: S3(정적 파일) + ALB(`/api/*`, `/oauth/*` 경로 — Spring/FastAPI, ArgoCD 등으로 라우팅)
-- **경로 기반 캐싱**: `/api/*`, `/oauth/*`는 TTL 0(무캐시)으로 인증/API 요청이 항상 오리진까지 전달되도록 구성했고, 그 외 정적 자산은 기본 1시간/최대 24시간 캐시.
-- **뷰어 HTTPS 강제**: 전체 behavior에서 `redirect-to-https` + `TLSv1.2_2021` 최소 프로토콜을 적용.
-- Route 53 루트/`www` 도메인이 CloudFront에 alias 레코드로 연결됩니다.
+**보안 그룹**: `sg_openvpn`(SSH/HTTPS/OpenVPN 포트), `sg_ec2`(Spring/FastAPI 포트, VPC CIDR 허용), `sg_db`(MySQL 포트, OpenVPN 경유만 허용)로 구성했습니다. 애플리케이션 포트(8080/8000)는 SG 참조 대신 VPC CIDR 전체 허용 방식을 택해, "VPC 내부망은 신뢰한다"는 전제를 SG 설계 전반에 일관되게 적용했습니다. 이 전제는 GitOps 리포의 ELK/Redis 무인증 설정과도 동일한 설계 철학을 공유합니다.
 
-> CloudFront↔ALB 구간의 오리진 프로토콜 등 세부 보안 설정은 [알려진 제약 사항](#알려진-제약-사항)을 참고하세요.
+**DNS**: Route53에 `argocd`/`kibana`/`api_root`/`api_www`/`apm` 5개 레코드를 ALB로, `cdn_root`/`cdn_www` 2개 레코드를 CloudFront로 alias 연결했습니다.
 
 ---
 
-## 데이터베이스
+## 스토리지 / CDN / 이미지 레지스트리
 
-애플리케이션 DB는 RDS가 아니라 **EC2 기반 자체 관리형 MySQL**(`modules/db_instance`)입니다.
+### S3 (`s3_static_site` 모듈)
+- 프론트엔드 정적 빌드 산출물(HTML/JS/CSS 등) 호스팅 전용 버킷입니다.
+- 버킷 자체를 직접 서비스하지 않고 아래 CloudFront의 오리진(`s3_origin_config` + OAI)으로만 연결되는 구조입니다.
+- Public Access Block 4개 옵션을 모두 활성화해 S3에 대한 직접 퍼블릭 접근을 완전히 차단하고, 버킷 정책으로 CloudFront OAI에게만 `s3:GetObject`를 허용합니다.
 
-| 항목 | 값 |
-|---|---|
-| 배치 | DB 서브넷(프라이빗, AZ1) 단일 인스턴스, 고정 프라이빗 IP |
-| 초기 데이터 | 최초 부팅 시 `user_data`가 S3(`koco-db-backup`)에서 최신 백업 파일을 1회 복원 |
-| 접근 제어 | OpenVPN 경유 관리 접근 + 애플리케이션(App 노드그룹) 접근으로 제한하는 SG 설계 |
+### CloudFront (`cdn` 모듈)
+- 오리진 2개로 구성됩니다: S3(정적 프론트엔드) + ALB-Spring(`custom_origin_config`, API 서버).
+- `/oauth/*`, `/api/*` 경로(`path_pattern`)는 ALB-Spring 오리진으로, 그 외 나머지 경로는 S3 오리진으로 분기해 정적 자산과 API 트래픽을 하나의 배포에서 함께 서빙합니다.
+- `aws_cloudfront_origin_access_identity`(OAI)로 S3에 대한 직접 접근을 차단하고 CloudFront를 통한 접근만 허용합니다.
+- `viewer_certificate`에 `acm_certificate_arn`을 지정하고 모든 behavior에서 `viewer_protocol_policy=redirect-to-https`로 설정해 HTTPS를 강제합니다(`minimum_protocol_version=TLSv1.2_2021`).
+- 정적 자산은 기본 1시간(최대 24시간) 엣지 캐싱을 적용해 응답 속도를 개선하고, `/api`, `/oauth` 경로는 TTL 0으로 캐시하지 않도록 구성했습니다.
 
-RDS 대신 EC2를 선택한 이유는 인스턴스 세부 튜닝 자유도와 비용 절감이며, 그 대가로 Multi-AZ 자동 장애조치나 자동 스냅샷 같은 관리형 기능은 직접 구현해야 합니다. 현재는 초기 시딩 스크립트만 있고 주기적 백업 자동화는 없는 상태로, [알려진 제약 사항](#알려진-제약-사항)에 개선 과제로 남겨두었습니다.
+### ECR (`ecr` 모듈)
+- Spring Boot 등 컨테이너 이미지를 저장하는 프라이빗 레지스트리이며, dev/prod 환경별로 저장소를 분리(`dev-ecr-repo`/`prod-ecr-repo`)했습니다.
+- GitOps 리포의 Deployment/`values.yaml`이 이 레지스트리의 이미지를 pull하는 경로로 사용합니다.
+- `scan_on_push=true`로 이미지 푸시 시 자동 취약점 스캔을 활성화했으며, 태그 정책은 `image_tag_mutability=MUTABLE`(기본값)입니다.
 
----
-
-## OpenVPN
-
-관리자가 프라이빗 네트워크(EKS 노드/DB)에 접근하는 유일한 진입점으로 OpenVPN EC2(`modules/openvpn`)를 퍼블릭 서브넷에 배치했습니다.
-
-| 항목 | 값 |
-|---|---|
-| 배치 | 퍼블릭 서브넷 + 고정 EIP |
-| IAM | 인스턴스 프로파일 없음 — AWS API를 호출할 필요가 없는 순수 VPN 게이트웨이로 최소 권한 원칙을 적용 |
-| SG | 22(SSH) / 443·1194(VPN 터널) / 943(관리 UI) |
-
-`sg_ec2`/`sg_db`는 OpenVPN의 보안 그룹을 소스로 참조해, **VPN을 경유해야만 SSH/DB 관리 접근이 가능**하도록 설계되어 있습니다(네트워크 설계 섹션의 [Security Group 계층 설계](#security-group-계층-설계) 참고).
-
----
-
-## ECR
-
-컨테이너 이미지 저장소는 다른 모듈과 독립적으로 존재하며, CI/CD 파이프라인이 빌드한 이미지를 이곳에 push합니다.
-
-| 항목 | 값 |
-|---|---|
-| 저장소명 | dev: `dev-ecr-repo` / prod: `prod-ecr-repo` |
-| 이미지 스캔 | `scan_on_push = true` (푸시 시 자동 취약점 스캔) |
-
-```bash
-aws ecr get-login-password --region ap-northeast-2 \
-  | docker login --username AWS --password-stdin <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com
-
-docker tag <image>:latest <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com/dev-ecr-repo:latest
-docker push <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com/dev-ecr-repo:latest
-```
-
----
-
-## 알려진 제약 사항
-
-내부 리뷰 과정에서 확인된, 실제 운영 전 반드시 검토가 필요한 지점을 투명하게 공유합니다.
-
-| 영역 | 내용 | 상태 |
-|---|---|---|
-| IRSA (ALB Controller) | `alb_ingress_sa_role`의 OIDC 신뢰 정책과 ServiceAccount 어노테이션 배선이 아직 끝까지 연결되지 않아, 현재 코드만으로는 IRSA 인증 체인이 완전히 동작하지 않음 | 🔧 수정 예정 |
-| EKS 노드 ↔ DB 보안 그룹 | `node_group_sg_id`가 빈 값으로 전달되어, 앱 노드그룹에서 DB로의 SG 기반 접근 허용 규칙이 실제로는 배선되어 있지 않음 | 🔧 수정 예정 |
-| DB 백업 | 자동 백업/스냅샷이 없음 — 최초 부팅 시 S3에서 1회 복원(시딩)만 수행 | 🔧 개선 예정 |
-| OpenVPN 초기 설정 | 부트스트랩 스크립트에 초기 자격증명이 하드코딩되어 있어 운영 전 교체가 필요 | 🔧 수정 예정 |
-| NAT Gateway | AZ1에 단일 배치되어 있어 해당 AZ 장애 시 다른 AZ의 아웃바운드 인터넷이 영향받을 수 있음 | 🔧 개선 예정 |
-| IAM 역할명 | `stage`로 파라미터화되어 있지 않아, 동일 계정에 dev/prod를 배포할 경우 이름 충돌 가능 | 🔧 개선 예정 |
-| ECR Lifecycle Policy | 오래된 이미지를 정리하는 수명주기 정책이 없음 | 🔧 개선 예정 |
-
-> ArgoCD와 GitOps 저장소([`kakaotech-21-iceT-gitops`](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops)) 연동 이후 실제로 어떤 애플리케이션(ELK 등)이 배포되는지는 별도 분석 후 이 문서에 반영할 예정입니다.
+### EC2 MySQL (`db_instance` 모듈)
+- Amazon RDS 대신 EC2 인스턴스에 `user_data`로 MySQL을 직접 설치하는 자체 관리형 방식(`aws_instance.mysql_server`)입니다. Terraform 코드/분석 문서상 RDS 대신 이 방식을 택한 이유가 별도로 명시되어 있지는 않아, 정확한 선택 배경은 확인되지 않았습니다. 다만 구조상 관리형 서비스(RDS) 대비 인스턴스·MySQL 설정을 자유롭게 제어할 수 있는 대신, Multi-AZ 자동 장애조치나 정기 백업 같은 RDS의 관리 기능은 직접 구현해야 하는 트레이드오프를 안고 있습니다.
+- DB 전용 프라이빗 서브넷(단일 AZ)에 고정 프라이빗 IP로 배치되며, 보안 그룹은 OpenVPN을 경유한 접근만 허용하도록 구성했습니다.
+- 초기 부팅 시 S3에 저장된 백업 파일을 1회 복원하는 스크립트가 포함되어 있습니다.
 
 ---
 
 ## 실행 방법
 
-### 0) 사전 준비물 (필수)
+### 사전 준비
+- Terraform, AWS CLI 설치 및 자격 증명 설정
+- Terraform state용 S3 버킷/DynamoDB 테이블이 아직 없다면 `koco/backend/`를 먼저 apply해 부트스트랩
+- **ACM 인증서 수동 발급 필요**: 이 리포에는 `aws_acm_certificate` 리소스가 없습니다. `aws acm request-certificate`로 인증서를 직접 발급한 뒤, 발급받은 ARN을 `environments/<env>/variables.tf`의 `acm_certificate_arn`에 채워 넣어야 합니다.
 
-이 코드는 특정 계정/도메인을 전제로 하므로, 그대로 `apply`하기 전에 아래 항목을 반드시 본인 환경에 맞게 준비·오버라이드해야 합니다.
+### 실행 순서
 
-| 항목 | 확인/준비 사항 |
-|---|---|
-| AWS 자격 증명 | `aws configure` 또는 환경변수로 대상 계정에 접근 가능한 자격 증명이 설정되어 있어야 함 |
-| Route53 호스팅 영역 | `domain_name`(기본값 `koco-test.click`/`ktbkoco.com`)을 소유한 도메인으로 교체하고, 해당 도메인의 Route53 호스팅 영역을 미리 생성 |
-| ACM 인증서 | `acm_certificate_arn` 변수의 기본값은 **빈 문자열(`""`)** 입니다. CloudFront/ALB HTTPS 리스너가 정상 동작하려면 위 도메인으로 발급받은 ACM 인증서 ARN을 `-var` 또는 `terraform.tfvars`로 반드시 지정해야 합니다 |
-| Terraform state 백엔드 버킷명 | `koco/backend`가 생성하는 S3 버킷명(기본 `koco-terraformstate`)은 전 세계에서 유일해야 하므로, 이미 사용 중이라면 `bucket_name` 변수를 변경 |
-
-### 1) Terraform state 백엔드(S3 + DynamoDB) 프로비저닝
+dev와 prod는 별도의 root module이므로, AWS 프로파일도 환경에 맞게 분리해서 실행합니다.
 
 ```bash
-cd koco/backend
-terraform init
-terraform plan
-terraform apply
-```
-
-### 2) 환경별 인프라 배포 (dev 예시)
-
-```bash
+# dev 환경
 cd koco/environments/dev
+AWS_PROFILE=dev terraform init
+AWS_PROFILE=dev terraform plan
+AWS_PROFILE=dev terraform apply
 
-terraform init
-terraform plan
-terraform apply
-```
-
-prod 환경도 동일한 순서로 `koco/environments/prod` 디렉터리에서 실행합니다.
-
-```bash
+# prod 환경
 cd koco/environments/prod
-terraform init
-terraform plan
-terraform apply
+AWS_PROFILE=prod terraform init
+AWS_PROFILE=prod terraform plan
+AWS_PROFILE=prod terraform apply
 ```
 
-> dev/prod는 동일한 모듈 구조를 사용하므로, 환경을 전환할 때는 디렉터리만 바꿔서 동일한 `init → plan → apply` 순서를 따르면 됩니다.
+> 더 자세한 기술 분석은 [📋 상세 기술 분석 문서](./docs/analysis/final_analysis.md)를 참고해주세요.
 
-> ⚠️ **state key 충돌 주의**: 두 환경의 `backend "s3"` 블록은 `key = "./terraform.tfstate"`로 코드상 동일하게 고정되어 있습니다. dev/prod를 같은 state 버킷에 그대로 순서대로 `init`하면 두 환경이 같은 state 파일을 공유하게 될 위험이 있으므로, 반드시 `terraform init -backend-config="key=dev/terraform.tfstate"`(prod는 `key=prod/terraform.tfstate`) 형태로 키를 분리하거나 `terraform workspace`로 환경을 구분한 뒤 진행하세요.
+---
 
-### 3) 리소스 정리
+## 연관 프로젝트
 
-```bash
-terraform destroy
-```
+### GitOps Repository
+
+🔗 [kakaotech-21-iceT-gitops](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops)
+
+이 Terraform 리포와 함께 동작하는 GitOps 리포입니다.
+
+| 항목 | 이 리포 (Terraform) | GitOps 리포 |
+|------|-------------------|------------|
+| 역할 | AWS 인프라 프로비저닝 | 애플리케이션 배포 관리 |
+| 도구 | Terraform | ArgoCD + Helm |
+| 관리 대상 | EKS, VPC, IAM, RDS 등 | Spring, ELK, Redis 등 |
+
+**연동 방식:**
+- 이 리포가 EKS 클러스터와 ArgoCD를 프로비저닝
+- ArgoCD가 GitOps 리포를 감시하며 워크로드 자동 배포
+- IAM IRSA/Pod Identity 역할은 이 리포에서 생성하고 GitOps 리포의 ServiceAccount가 소비하는 구조
+
 

@@ -5,3 +5,6 @@ output "eks_node_group_role_arn" {
 output "ebs_csi_irsa_role_arn" {
   value = aws_iam_role.ebs_csi_irsa_role.arn
 }
+output "alb_ingress_sa_role_arn" {
+  value = aws_iam_role.alb_ingress_sa_role.arn
+}

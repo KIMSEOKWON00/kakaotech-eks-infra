@@ -3,16 +3,17 @@ variable "role-alc_role_name"{
   default = "alb-ingress-sa-role"
 }
 
-variable "role-alc-oidc_without_https"{
-  type = string
-}
-
 variable "role-alc-namespace"{
   type = string
 }
 
 variable "role-alc-sa_name"{
   type = string
+}
+
+variable "cluster_name" {
+  description = "EKS 클러스터 이름 (Pod Identity Association 대상)"
+  type        = string
 }
 
 variable "oidc_provider_arn" {
@@ -24,3 +25,4 @@ variable "oidc_url_without_https" {
   description = "EKS OIDC Issuer URL without https://"
   type        = string
 }
+
