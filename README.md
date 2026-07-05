@@ -12,6 +12,8 @@ Terraform × EKS × GitOps Infrastructure
 
 **Terraform으로 AWS EKS 클러스터와 주변 인프라(VPC, IAM, ALB, CloudFront, ECR 등)를 코드화하고, ArgoCD 기반 GitOps로 애플리케이션 배포를 자동화한 인프라 프로젝트**입니다. IAM 인증 체계를 OIDC/IRSA에서 **EKS Pod Identity**로 전환했고, 인프라(Terraform 리포)와 애플리케이션(GitOps 리포)의 책임 경계를 명확히 분리해 설계했습니다.
 
+이 프로젝트는 [kakaotech-21-iceT-gitops](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops) GitOps 저장소와 연동되며, ArgoCD 기반 GitOps 워크플로우를 통해 배포 및 관리됩니다.
+
 ---
 
 ## 목차
