@@ -25,7 +25,6 @@
 6. [IAM 및 IRSA 설계](#iam-및-irsa-설계)
 7. [네트워크 설계](#네트워크-설계)
 8. [실행 방법](#실행-방법)
-9. [발표자료](#발표자료)
 
 ---
 
@@ -49,16 +48,16 @@
                      ALB (AWS Load Balancer Controller가
                       Ingress 기반으로 자동 생성/관리)
                                  │
-                  ┌──────────────┴──────────────┐
-                  │          EKS Cluster         │
-                  │   (Public + Private Endpoint) │
+                  ┌───────────────┴───────────────┐
+                  │          EKS Cluster          │
+                  │  (Public + Private Endpoint)  │
                   │                               │
-         ┌────────┴────────┐          ┌───────────┴──────────┐
+         ┌────────┴─────────┐          ┌───────────┴───────────┐
          │   Node Group     │          │    Node Group         │
          │   "infra"        │          │    "app"              │
          │   t3.medium × 4~5│          │    t3.medium × 1~2    │
          │   (ArgoCD, ELK)  │          │    (Spring/FastAPI)   │
-         └────────┬─────────┘          └───────────┬──────────┘
+         └────────┬─────────┘          └───────────┬───────────┘
                   │                                 │
            Service Subnet (Private, AZ1/AZ2) ───────┘
                   │
@@ -100,6 +99,7 @@
 ![Route53](https://img.shields.io/badge/Route%2053-8C4FFF?style=for-the-badge&logo=amazonaws&logoColor=white)
 ![ECR](https://img.shields.io/badge/Amazon%20ECR-FF9900?style=for-the-badge&logo=amazonaws&logoColor=white)
 ![IAM](https://img.shields.io/badge/IAM-DD344C?style=for-the-badge&logo=amazoniam&logoColor=white)
+![ACM](https://img.shields.io/badge/Certificate%20Manager-DD344C?style=for-the-badge&logo=amazonaws&logoColor=white)
 ![DynamoDB](https://img.shields.io/badge/DynamoDB-4053D6?style=for-the-badge&logo=amazondynamodb&logoColor=white)
 
 | 항목 | 버전 |
@@ -130,6 +130,22 @@
 | 10 | `ecr` | 컨테이너 이미지 저장소 |
 
 **원격 모듈**: `terraform-aws-modules/eks/aws ~>20.0`을 사용해 EKS 클러스터·노드그룹·OIDC Provider·애드온 생성을 위임하고, v20의 **Access Entry API**(`enable_cluster_creator_admin_permissions`)로 클러스터 접근 권한을 관리합니다(레거시 `aws_auth` ConfigMap 미사용).
+
+> 클러스터/노드그룹/OIDC Provider를 직접 `aws_eks_cluster` 등 raw 리소스로 구현하는 대신 커뮤니티 표준 원격 모듈을 채택한 이유는, EKS 신규 기능(Access Entry API 등)이 공식 모듈에 가장 먼저 반영되고, 검증된 코드로 노드그룹/애드온 관리 보일러플레이트를 줄여 로컬 모듈(`iam`, `service_account`, `helm`)의 IRSA 연동 로직에 집중할 수 있기 때문입니다.
+
+### 환경별(dev/prod) 구성 차이
+
+dev/prod는 아래 표에 해당하는 변수 값만 다르고, 그 외 모듈 구조·EKS 스펙·애드온 구성은 완전히 동일합니다.
+
+| 항목 | dev | prod |
+|---|---|---|
+| VPC CIDR | `10.110.0.0/16` | `10.120.0.0/16` |
+| 도메인 | `koco-test.click` | `ktbkoco.com` |
+| EKS 클러스터 이름 | `koco-dev-cluster` | `koco-prod-cluster` |
+| S3 정적 사이트 버킷 | `dev-koco-front-s3` | `prod-koco-front-s3` |
+| ECR 저장소 | `dev-ecr-repo` | `prod-ecr-repo` |
+
+동일한 코드베이스로 두 환경을 재현 가능하게 유지하면서, 네트워크 대역과 리소스 네이밍만 환경 변수로 분리하는 전략입니다.
 
 ### 모듈 의존성 흐름
 
@@ -251,6 +267,8 @@ resource "helm_release" "argocd" {
 - ALB의 HTTPS(443) 리스너가 TLS 종료를 담당하고 ALB→Pod 구간은 `--insecure`(HTTP)로 통신 — TLS 종료를 로드밸런서에서 처리하는 일반적인 패턴입니다.
 - ALB 생성 후 `data.aws_lbs`/`data.aws_lb`로 조회하여 Route53에 `argocd` / `kibana` / `api` / `www.api` 서브도메인 레코드를 자동 등록합니다.
 
+**GitOps 워크플로우**: ArgoCD는 애플리케이션 매니페스트를 별도의 GitOps 전용 저장소인 [`kakaotech-21-iceT-gitops`](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops)를 Source of Truth로 두고 동기화합니다. 이 저장소(Terraform 인프라 저장소)는 EKS/ALB Controller/ArgoCD "플랫폼"을 프로비저닝하는 역할까지만 담당하고, 그 위에서 실행되는 애플리케이션의 배포 선언(Deployment/Service/Ingress 매니페스트 등)은 GitOps 저장소에서 별도로 관리하는 **인프라-애플리케이션 저장소 분리** 구조입니다.
+
 ---
 
 ## IAM 및 IRSA 설계
@@ -337,28 +355,33 @@ OpenVPN을 유일한 관리 진입점으로 삼아, DB/EC2로의 SSH·관리 접
 
 ## 실행 방법
 
-### 사전 준비
+### 0) 사전 준비물 (필수)
+
+이 코드는 특정 계정/도메인을 전제로 하므로, 그대로 `apply`하기 전에 아래 항목을 반드시 본인 환경에 맞게 준비·오버라이드해야 합니다.
+
+| 항목 | 확인/준비 사항 |
+|---|---|
+| AWS 자격 증명 | `aws configure` 또는 환경변수로 대상 계정에 접근 가능한 자격 증명이 설정되어 있어야 함 |
+| Route53 호스팅 영역 | `domain_name`(기본값 `koco-test.click`/`ktbkoco.com`)을 소유한 도메인으로 교체하고, 해당 도메인의 Route53 호스팅 영역을 미리 생성 |
+| ACM 인증서 | `acm_certificate_arn` 변수의 기본값은 **빈 문자열(`""`)** 입니다. CloudFront/ALB HTTPS 리스너가 정상 동작하려면 위 도메인으로 발급받은 ACM 인증서 ARN을 `-var` 또는 `terraform.tfvars`로 반드시 지정해야 합니다 |
+| Terraform state 백엔드 버킷명 | `koco/backend`가 생성하는 S3 버킷명(기본 `koco-terraformstate`)은 전 세계에서 유일해야 하므로, 이미 사용 중이라면 `bucket_name` 변수를 변경 |
+
+### 1) Terraform state 백엔드(S3 + DynamoDB) 프로비저닝
 
 ```bash
-# 1) Terraform state 백엔드(S3 + DynamoDB) 프로비저닝
 cd koco/backend
 terraform init
 terraform plan
 terraform apply
 ```
 
-### 환경별 인프라 배포 (dev 예시)
+### 2) 환경별 인프라 배포 (dev 예시)
 
 ```bash
 cd koco/environments/dev
 
-# 2) 초기화 (backend 설정 로드 및 provider 플러그인 설치)
 terraform init
-
-# 3) 실행 계획 확인
 terraform plan
-
-# 4) 인프라 적용
 terraform apply
 ```
 
@@ -373,7 +396,9 @@ terraform apply
 
 > dev/prod는 동일한 모듈 구조를 사용하므로, 환경을 전환할 때는 디렉터리만 바꿔서 동일한 `init → plan → apply` 순서를 따르면 됩니다.
 
-### 리소스 정리
+> ⚠️ **state key 충돌 주의**: 두 환경의 `backend "s3"` 블록은 `key = "./terraform.tfstate"`로 코드상 동일하게 고정되어 있습니다. dev/prod를 같은 state 버킷에 그대로 순서대로 `init`하면 두 환경이 같은 state 파일을 공유하게 될 위험이 있으므로, 반드시 `terraform init -backend-config="key=dev/terraform.tfstate"`(prod는 `key=prod/terraform.tfstate`) 형태로 키를 분리하거나 `terraform workspace`로 환경을 구분한 뒤 진행하세요.
+
+### 3) 리소스 정리
 
 ```bash
 terraform destroy
