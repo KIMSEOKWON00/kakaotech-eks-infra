@@ -8,6 +8,7 @@ module "koco_vpc" {
   stage               = var.stage
   servicename         = var.servicename
   tags                = var.vpc_tags
+  cluster_name        = local.cluster_name
 
   az                  = var.az
   vpc_ip_range        = var.vpc_ip_range

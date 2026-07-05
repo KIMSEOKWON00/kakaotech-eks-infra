@@ -169,7 +169,20 @@ resource "aws_route53_record" "api_root" {
 
 resource "aws_route53_record" "api_www" {
   zone_id = data.aws_route53_zone.main.zone_id
-  name    = "www.api.${var.domain_name}" 
+  name    = "www.api.${var.domain_name}"
+  type    = "A"
+
+  alias {
+    name                   = data.aws_lb.argocd_alb.dns_name
+    zone_id                = data.aws_lb.argocd_alb.zone_id
+    evaluate_target_health = false
+  }
+}
+
+# Route 53 - apm
+resource "aws_route53_record" "apm" {
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = "apm.${var.domain_name}"
   type    = "A"
 
   alias {

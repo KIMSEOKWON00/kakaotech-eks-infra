@@ -1,7 +1,3 @@
-locals {
-  cluster_name = "koco-cluster" # 원하는 클러스터 이름
-}
-
 #=============================================#
 # VPC 생성
 resource "aws_vpc" "aws-vpc" {
@@ -23,7 +19,7 @@ resource "aws_subnet" "public-az1" {
 
   tags = merge(tomap({
     Name                                          = "subnet-pub-az1-${var.stage}-${var.servicename}",
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared", #shared는 여러 클러스터가 공유할 수 있음을 의미하며, owned는 특정 클러스터가 독점
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared", #shared는 여러 클러스터가 공유할 수 있음을 의미하며, owned는 특정 클러스터가 독점
     "kubernetes.io/role/elb"                      = "1" # EKS에서 퍼블릭 LoadBalancer (Classic ELB, ALB) 를 만들 때, 이 태그가 있어야 퍼블릭 서브넷으로 인식
   }), var.tags)
 
@@ -37,8 +33,8 @@ resource "aws_subnet" "public-az2" {
 
   tags = merge(tomap({
     Name                                          = "subnet-pub-az2-${var.stage}-${var.servicename}",
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared", 
-    "kubernetes.io/role/elb"                      = "1" 
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared",
+    "kubernetes.io/role/elb"                      = "1"
   }), var.tags)
 
   depends_on = [aws_vpc.aws-vpc]
@@ -51,7 +47,7 @@ resource "aws_subnet" "service-az1" {
 
   tags = merge(tomap({
     Name                                          = "subnet-svc-az1-${var.stage}-${var.servicename}",
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared", 
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared",
     "kubernetes.io/role/internal-elb"             = "1" # 내부용 LoadBalancer (internal ELB) 를 위한 서브넷으로 지정
     # EKS에서 internal 유형의 서비스 (Service type: LoadBalancer + internal)를 만들 때 이 서브넷이 선택
   }), var.tags)
@@ -66,8 +62,8 @@ resource "aws_subnet" "service-az2" {
 
   tags = merge(tomap({
     Name                                          = "subnet-svc-az2-${var.stage}-${var.servicename}",
-    "kubernetes.io/cluster/${local.cluster_name}" = "shared", 
-    "kubernetes.io/role/internal-elb"             = "1" 
+    "kubernetes.io/cluster/${var.cluster_name}"   = "shared",
+    "kubernetes.io/role/internal-elb"             = "1"
   }), var.tags)
 
   depends_on = [aws_vpc.aws-vpc]

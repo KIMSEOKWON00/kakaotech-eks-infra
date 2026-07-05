@@ -1,3 +1,5 @@
+data "aws_caller_identity" "current" {}
+
 resource "aws_iam_role" "node_group_role" {
   name = "eks-node-group-role"
 
@@ -33,7 +35,7 @@ resource "aws_iam_role" "alb_ingress_sa_role" {
         {
             "Effect": "Allow",
             "Principal": {
-                "Federated": "arn:aws:iam::<계정ID>:oidc-provider/${var.role-alc-oidc_without_https}"
+                "Federated": "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${var.role-alc-oidc_without_https}"
             },
             "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {

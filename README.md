@@ -24,51 +24,57 @@
 5. [Helm 배포 구성](#helm-배포-구성)
 6. [IAM 및 IRSA 설계](#iam-및-irsa-설계)
 7. [네트워크 설계](#네트워크-설계)
-8. [실행 방법](#실행-방법)
+8. [스토리지 및 CDN](#스토리지-및-cdn)
+9. [데이터베이스](#데이터베이스)
+10. [OpenVPN](#openvpn)
+11. [ECR](#ecr)
+12. [알려진 제약 사항](#알려진-제약-사항)
+13. [실행 방법](#실행-방법)
 
 ---
 
 ## 전체 인프라 아키텍처
 
-```
-                              Internet
-                                 │
-                  ┌──────────────┴──────────────┐
-                  │                             │
-             Route 53                      Route 53
-        (root/www → CDN)          (argocd/kibana/api/www.api → ALB)
-                  │                             │
-           CloudFront (CDN)                     │
-         ┌────────┴─────────┐                   │
-         │                  │                   │
-     S3 Origin          ALB Origin ──────────────┘
-   (정적 사이트,          (path: /api/*, /oauth/*)
-    OAI 경유)
-                                 │
-                     ALB (AWS Load Balancer Controller가
-                      Ingress 기반으로 자동 생성/관리)
-                                 │
-                  ┌───────────────┴───────────────┐
-                  │          EKS Cluster          │
-                  │  (Public + Private Endpoint)  │
-                  │                               │
-         ┌────────┴─────────┐          ┌───────────┴───────────┐
-         │   Node Group     │          │    Node Group         │
-         │   "infra"        │          │    "app"              │
-         │   t3.medium × 4~5│          │    t3.medium × 1~2    │
-         │   (ArgoCD, ELK)  │          │    (Spring/FastAPI)   │
-         └────────┬─────────┘          └───────────┬───────────┘
-                  │                                 │
-           Service Subnet (Private, AZ1/AZ2) ───────┘
-                  │
-                  ├──→ NAT Gateway (AZ1) → IGW → Internet (Outbound)
-                  │
-                  └──→ DB Subnet (AZ1): EC2 기반 MySQL 서버
-                            ↑
-                       S3(koco-db-backup)에서 초기 데이터 복원
+```mermaid
+flowchart TB
+    Internet((Internet))
 
-  Public Subnet (AZ1/AZ2): OpenVPN EC2(고정 EIP) — 관리자 VPN 진입점
-  ECR: 컨테이너 이미지 저장소 (독립 리소스)
+    subgraph DNS["Route 53"]
+        R53CDN["root / www<br/>→ CloudFront"]
+        R53ALB["argocd / kibana / api / www.api<br/>→ ALB"]
+    end
+
+    CDN["CloudFront (CDN)"]
+    S3["S3 정적 사이트<br/>(OAI 경유)"]
+    ALB["ALB<br/>(AWS Load Balancer Controller가<br/>Ingress 기반으로 자동 생성/관리)"]
+
+    subgraph EKS["EKS Cluster (Public + Private Endpoint)"]
+        NGInfra["Node Group: infra<br/>t3.medium × 4~5<br/>(ArgoCD, ELK 등)"]
+        NGApp["Node Group: app<br/>t3.medium × 1~2<br/>(Spring/FastAPI)"]
+    end
+
+    SVC["Service Subnet<br/>(Private, AZ1/AZ2)"]
+    NAT["NAT Gateway (AZ1)"]
+    IGW["Internet Gateway"]
+    DB[("EC2 MySQL<br/>DB Subnet (AZ1)")]
+    Backup[("S3: koco-db-backup")]
+    PubSubnet["Public Subnet (AZ1/AZ2)"]
+    VPN["OpenVPN EC2<br/>(고정 EIP)"]
+    ECR["ECR<br/>(독립 리소스)"]
+
+    Internet --> R53CDN --> CDN
+    Internet --> R53ALB --> ALB
+    CDN -->|정적 파일| S3
+    CDN -->|"/api/*, /oauth/*"| ALB
+    ALB --> EKS
+    NGInfra --- SVC
+    NGApp --- SVC
+    SVC --> NAT --> IGW --> Internet
+    SVC --> DB
+    Backup -.초기 데이터 복원.-> DB
+    PubSubnet --> VPN
+    VPN -.관리자 SSH/DB 접근.-> SVC
+    VPN -.관리자 접근.-> DB
 ```
 
 ### 트래픽 흐름 요약
@@ -214,6 +220,8 @@ module "eks" {
 
 인프라 워크로드와 애플리케이션 워크로드를 노드그룹 라벨(`node-group=infra`/`app`)로 분리해 스케줄링 관심사를 나누는 설계입니다. 두 노드그룹 모두 서비스(프라이빗) 서브넷 2개 AZ에 걸쳐 배치되어 기본적인 고가용성을 확보합니다.
 
+dev/prod가 동일한 노드그룹 스펙을 쓰는 이유는 두 환경의 인프라 구조를 100% 동일하게 유지해, dev에서 검증한 배포·스케줄링 동작이 prod에서도 그대로 재현되도록 하기 위함입니다. 트래픽 규모에 따라 환경별로 노드 수/인스턴스 타입을 차등화하는 전략은 현재 범위 밖이며, 필요 시 `eks_managed_node_groups` 값만 환경 변수로 분리하면 됩니다.
+
 ### 클러스터 접근 관리
 
 - v20의 **Access Entry API** 채택(`enable_cluster_creator_admin_permissions = true`) — 클러스터 생성자에게 자동으로 관리자 권한 부여.
@@ -301,6 +309,8 @@ Condition = {
 
 EKS OIDC Identity Provider를 Federated 주체로 신뢰하고, `sub`/`aud` 조건으로 **특정 네임스페이스의 특정 ServiceAccount만** 해당 IAM Role을 assume할 수 있도록 제한하는 IRSA 표준 패턴을 적용했습니다. `cluster_oidc_issuer_url` → `iam` 모듈 → `service_account` 모듈로 이어지는 참조 체인을 통해 Terraform 모듈 간에 OIDC 신뢰 관계를 조립합니다.
 
+> ⚠️ **현재 구현 상태**: 위 구조는 설계상 표준 IRSA 트러스트 패턴을 따르지만, 실제 코드에서는 `alb_ingress_sa_role`의 Federated 신뢰 주체 값과 ServiceAccount의 `eks.amazonaws.com/role-arn` 어노테이션 배선이 아직 끝까지 연결되어 있지 않아 IRSA 인증 체인이 완전히 동작하지는 않는 상태입니다. 자세한 내용과 개선 계획은 [알려진 제약 사항](#알려진-제약-사항)을 참고하세요.
+
 ### IAM 정책 설계
 
 `alb-ingress-sa-role`에는 AWS 공식 **AWS Load Balancer Controller IAM Policy** 원문을 그대로 적용했습니다. SG/ALB/TargetGroup 관련 다수의 삭제·수정 액션에 `elbv2.k8s.aws/cluster` 리소스 태그 조건을 걸어, 컨트롤러가 직접 생성/관리하는 리소스로 권한 범위를 좁히는 AWS 권장 최소 권한 패턴을 따릅니다.
@@ -350,6 +360,96 @@ OpenVPN을 유일한 관리 진입점으로 삼아, DB/EC2로의 SSH·관리 접
 
 - EKS 클러스터와 데이터베이스는 프라이빗 서브넷에만 배치되어 인터넷에 직접 노출되지 않습니다.
 - 아웃바운드 트래픽은 NAT Gateway를 경유하며, EKS 클러스터 엔드포인트는 Public/Private 접근을 모두 지원해 CI/CD와 사내망 양쪽에서의 접근을 허용합니다.
+
+---
+
+## 스토리지 및 CDN
+
+프론트엔드 정적 파일은 S3 + CloudFront 조합으로, API/GitOps 트래픽은 ALB를 거쳐 같은 CloudFront 배포 안에서 경로 기반으로 통합됩니다.
+
+### S3 정적 사이트 (`modules/s3_static_site`)
+
+| 항목 | 설정 |
+|---|---|
+| 버킷명 | dev: `dev-koco-front-s3` / prod: `prod-koco-front-s3` |
+| Public Access Block | 4개 옵션 모두 활성화 (퍼블릭 접근 완전 차단) |
+| 접근 허용 | CloudFront Origin Access Identity(OAI)에게만 `s3:GetObject` 허용 |
+
+버킷은 퍼블릭 웹사이트 엔드포인트가 아니라 **REST API 엔드포인트 + OAI** 방식으로만 CloudFront에서 접근 가능하도록 설계되어 있습니다.
+
+### CloudFront (`modules/cdn`)
+
+- **듀얼 오리진**: S3(정적 파일) + ALB(`/api/*`, `/oauth/*` 경로 — Spring/FastAPI, ArgoCD 등으로 라우팅)
+- **경로 기반 캐싱**: `/api/*`, `/oauth/*`는 TTL 0(무캐시)으로 인증/API 요청이 항상 오리진까지 전달되도록 구성했고, 그 외 정적 자산은 기본 1시간/최대 24시간 캐시.
+- **뷰어 HTTPS 강제**: 전체 behavior에서 `redirect-to-https` + `TLSv1.2_2021` 최소 프로토콜을 적용.
+- Route 53 루트/`www` 도메인이 CloudFront에 alias 레코드로 연결됩니다.
+
+> CloudFront↔ALB 구간의 오리진 프로토콜 등 세부 보안 설정은 [알려진 제약 사항](#알려진-제약-사항)을 참고하세요.
+
+---
+
+## 데이터베이스
+
+애플리케이션 DB는 RDS가 아니라 **EC2 기반 자체 관리형 MySQL**(`modules/db_instance`)입니다.
+
+| 항목 | 값 |
+|---|---|
+| 배치 | DB 서브넷(프라이빗, AZ1) 단일 인스턴스, 고정 프라이빗 IP |
+| 초기 데이터 | 최초 부팅 시 `user_data`가 S3(`koco-db-backup`)에서 최신 백업 파일을 1회 복원 |
+| 접근 제어 | OpenVPN 경유 관리 접근 + 애플리케이션(App 노드그룹) 접근으로 제한하는 SG 설계 |
+
+RDS 대신 EC2를 선택한 이유는 인스턴스 세부 튜닝 자유도와 비용 절감이며, 그 대가로 Multi-AZ 자동 장애조치나 자동 스냅샷 같은 관리형 기능은 직접 구현해야 합니다. 현재는 초기 시딩 스크립트만 있고 주기적 백업 자동화는 없는 상태로, [알려진 제약 사항](#알려진-제약-사항)에 개선 과제로 남겨두었습니다.
+
+---
+
+## OpenVPN
+
+관리자가 프라이빗 네트워크(EKS 노드/DB)에 접근하는 유일한 진입점으로 OpenVPN EC2(`modules/openvpn`)를 퍼블릭 서브넷에 배치했습니다.
+
+| 항목 | 값 |
+|---|---|
+| 배치 | 퍼블릭 서브넷 + 고정 EIP |
+| IAM | 인스턴스 프로파일 없음 — AWS API를 호출할 필요가 없는 순수 VPN 게이트웨이로 최소 권한 원칙을 적용 |
+| SG | 22(SSH) / 443·1194(VPN 터널) / 943(관리 UI) |
+
+`sg_ec2`/`sg_db`는 OpenVPN의 보안 그룹을 소스로 참조해, **VPN을 경유해야만 SSH/DB 관리 접근이 가능**하도록 설계되어 있습니다(네트워크 설계 섹션의 [Security Group 계층 설계](#security-group-계층-설계) 참고).
+
+---
+
+## ECR
+
+컨테이너 이미지 저장소는 다른 모듈과 독립적으로 존재하며, CI/CD 파이프라인이 빌드한 이미지를 이곳에 push합니다.
+
+| 항목 | 값 |
+|---|---|
+| 저장소명 | dev: `dev-ecr-repo` / prod: `prod-ecr-repo` |
+| 이미지 스캔 | `scan_on_push = true` (푸시 시 자동 취약점 스캔) |
+
+```bash
+aws ecr get-login-password --region ap-northeast-2 \
+  | docker login --username AWS --password-stdin <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com
+
+docker tag <image>:latest <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com/dev-ecr-repo:latest
+docker push <account-id>.dkr.ecr.ap-northeast-2.amazonaws.com/dev-ecr-repo:latest
+```
+
+---
+
+## 알려진 제약 사항
+
+내부 리뷰 과정에서 확인된, 실제 운영 전 반드시 검토가 필요한 지점을 투명하게 공유합니다.
+
+| 영역 | 내용 | 상태 |
+|---|---|---|
+| IRSA (ALB Controller) | `alb_ingress_sa_role`의 OIDC 신뢰 정책과 ServiceAccount 어노테이션 배선이 아직 끝까지 연결되지 않아, 현재 코드만으로는 IRSA 인증 체인이 완전히 동작하지 않음 | 🔧 수정 예정 |
+| EKS 노드 ↔ DB 보안 그룹 | `node_group_sg_id`가 빈 값으로 전달되어, 앱 노드그룹에서 DB로의 SG 기반 접근 허용 규칙이 실제로는 배선되어 있지 않음 | 🔧 수정 예정 |
+| DB 백업 | 자동 백업/스냅샷이 없음 — 최초 부팅 시 S3에서 1회 복원(시딩)만 수행 | 🔧 개선 예정 |
+| OpenVPN 초기 설정 | 부트스트랩 스크립트에 초기 자격증명이 하드코딩되어 있어 운영 전 교체가 필요 | 🔧 수정 예정 |
+| NAT Gateway | AZ1에 단일 배치되어 있어 해당 AZ 장애 시 다른 AZ의 아웃바운드 인터넷이 영향받을 수 있음 | 🔧 개선 예정 |
+| IAM 역할명 | `stage`로 파라미터화되어 있지 않아, 동일 계정에 dev/prod를 배포할 경우 이름 충돌 가능 | 🔧 개선 예정 |
+| ECR Lifecycle Policy | 오래된 이미지를 정리하는 수명주기 정책이 없음 | 🔧 개선 예정 |
+
+> ArgoCD와 GitOps 저장소([`kakaotech-21-iceT-gitops`](https://github.com/KIMSEOKWON00/kakaotech-21-iceT-gitops)) 연동 이후 실제로 어떤 애플리케이션(ELK 등)이 배포되는지는 별도 분석 후 이 문서에 반영할 예정입니다.
 
 ---
 
