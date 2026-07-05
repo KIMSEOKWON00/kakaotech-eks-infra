@@ -9,3 +9,5 @@ koco/environments/dev/*.tfstate.*
 koco/environments/prod/.terraform/
 koco/environments/prod/*.tfstate
 koco/environments/prod/*.tfstate.*
+
+docs/
